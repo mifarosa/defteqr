@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DefteQR</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f23; --muted:#6b7280; --accent:#2563eb; --danger:#dc2626; --line:#e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1a1e24; --text:#eceff3; --muted:#9aa3af; --accent:#60a5fa; --danger:#f87171; --line:#2a3038; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:10px; padding:14px 16px; background:var(--card); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:18px; margin:0; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  button { font:inherit; border:0; border-radius:10px; padding:10px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); }
+  button.danger { background:transparent; color:var(--danger); border:1px solid var(--line); }
+  button.small { padding:6px 10px; font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:10px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .grow { flex:1; min-width:0; }
+  .muted { color:var(--muted); font-size:13px; }
+  .title { font-weight:600; }
+  .val { word-break:break-all; }
+  .empty { text-align:center; color:var(--muted); padding:32px 0; }
+  #videoWrap { position:relative; border-radius:12px; overflow:hidden; background:#000; margin-bottom:12px; display:none; }
+  video { width:100%; display:block; max-height:55vh; object-fit:cover; }
+  .frame { position:absolute; inset:18% 18%; border:3px solid rgba(255,255,255,.85); border-radius:14px; pointer-events:none; }
+  .flash { animation:flash .4s; }
+  @keyframes flash { from { outline:4px solid #22c55e; } to { outline:4px solid transparent; } }
+  input[type=text] { font:inherit; width:100%; padding:10px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  .toast { position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:#111; color:#fff; padding:10px 16px; border-radius:20px; font-size:14px; opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <button class="ghost small" id="backBtn" hidden>← Defterler</button>
+  <h1 id="title">DefteQR</h1>
+  <button class="ghost small" id="renameBtn" hidden>Adı değiştir</button>
+</header>
+<main id="app"></main>
+<div class="toast" id="toast"></div>
+<canvas id="canvas" hidden></canvas>
+<input type="file" id="fileInput" accept="image/*" hidden>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script>
+const KEY = 'defteqr.v1';
+const $ = s => document.querySelector(s);
+const fmt = t => new Date(t).toLocaleString('tr-TR', { dateStyle:'medium', timeStyle:'short' });
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const isUrl = s => /^https?:\/\//i.test(s);
+
+let db = { notebooks: [] };
+try { db = JSON.parse(localStorage.getItem(KEY)) || db; } catch {}
+const save = () => localStorage.setItem(KEY, JSON.stringify(db));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+let current = null;       // açık defterin id'si
+let stream = null, scanning = false, lastText = '', lastAt = 0;
+
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1600);
+}
+
+/* ---------- Defter listesi ---------- */
+function showList() {
+  stopCamera(); current = null;
+  $('#title').textContent = 'DefteQR';
+  $('#backBtn').hidden = true; $('#renameBtn').hidden = true;
+  const list = [...db.notebooks].sort((a, b) => b.updated - a.updated);
+  $('#app').innerHTML = `
+    <div class="card"><div class="row">
+      <div class="grow"><input type="text" id="newName" placeholder="Yeni defter adı (boşsa tarih kullanılır)"></div>
+      <button id="newBtn">Oluştur</button>
+    </div></div>
+    ${list.length ? list.map(n => `
+      <div class="card"><div class="row">
+        <div class="grow" data-open="${n.id}" style="cursor:pointer">
+          <div class="title">${esc(n.name)}</div>
+          <div class="muted">${fmt(n.created)} · ${n.scans.length} kayıt</div>
+        </div>
+        <button class="danger small" data-del="${n.id}">Sil</button>
+      </div></div>`).join('') : '<div class="empty">Henüz defter yok.<br>Yukarıdan bir defter oluşturup QR okutmaya başlayın.</div>'}`;
+  $('#newBtn').onclick = () => {
+    const name = $('#newName').value.trim() || 'Defter ' + fmt(Date.now());
+    const n = { id: uid(), name, created: Date.now(), updated: Date.now(), scans: [] };
+    db.notebooks.push(n); save(); openNotebook(n.id);
+  };
+  document.querySelectorAll('[data-open]').forEach(el => el.onclick = () => openNotebook(el.dataset.open));
+  document.querySelectorAll('[data-del]').forEach(el => el.onclick = () => {
+    const n = db.notebooks.find(x => x.id === el.dataset.del);
+    if (confirm(`"${n.name}" ve içindeki ${n.scans.length} kayıt silinsin mi?`)) {
+      db.notebooks = db.notebooks.filter(x => x !== n); save(); showList();
+    }
+  });
+}
+
+/* ---------- Defter içi ---------- */
+const nb = () => db.notebooks.find(n => n.id === current);
+
+function openNotebook(id) {
+  current = id;
+  $('#title').textContent = nb().name;
+  $('#backBtn').hidden = false; $('#renameBtn').hidden = false;
+  $('#app').innerHTML = `
+    <div id="videoWrap"><video id="video" playsinline muted></video><div class="frame"></div></div>
+    <div class="row" style="margin-bottom:12px">
+      <button id="camBtn">📷 Kamerayı aç</button>
+      <button class="ghost" id="imgBtn">🖼 Görselden oku</button>
+      <button class="ghost" id="csvBtn">⬇ Dışa aktar</button>
+    </div>
+    <div id="scans"></div>`;
+  $('#camBtn').onclick = toggleCamera;
+  $('#imgBtn').onclick = () => $('#fileInput').click();
+  $('#csvBtn').onclick = exportCsv;
+  renderScans();
+}
+
+function renderScans() {
+  const n = nb();
+  const items = [...n.scans].reverse();
+  $('#scans').innerHTML = items.length ? items.map(s => `
+    <div class="card"><div class="row">
+      <div class="grow">
+        <div class="val">${isUrl(s.text) ? `<a href="${esc(s.text)}" target="_blank" rel="noopener">${esc(s.text)}</a>` : esc(s.text)}</div>
+        <div class="muted">${fmt(s.time)}</div>
+      </div>
+      <button class="ghost small" data-copy="${s.id}">Kopyala</button>
+      <button class="danger small" data-rm="${s.id}">✕</button>
+    </div></div>`).join('') : '<div class="empty">Bu defterde henüz kayıt yok.</div>';
+  document.querySelectorAll('[data-copy]').forEach(b => b.onclick = () => {
+    navigator.clipboard?.writeText(n.scans.find(s => s.id === b.dataset.copy).text); toast('Kopyalandı');
+  });
+  document.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => {
+    n.scans = n.scans.filter(s => s.id !== b.dataset.rm); save(); renderScans();
+  });
+}
+
+function addScan(text) {
+  const now = Date.now();
+  if (text === lastText && now - lastAt < 3000) { lastAt = now; return; } // aynı kodu tekrar tekrar ekleme
+  lastText = text; lastAt = now;
+  const n = nb();
+  n.scans.push({ id: uid(), text, time: now }); n.updated = now; save();
+  renderScans(); toast('Kaydedildi ✓');
+  if (navigator.vibrate) navigator.vibrate(60);
+  $('#videoWrap')?.classList.remove('flash'); void $('#videoWrap')?.offsetWidth; $('#videoWrap')?.classList.add('flash');
+}
+
+/* ---------- Kamera ---------- */
+async function toggleCamera() {
+  if (stream) return stopCamera();
+  if (!window.jsQR) return toast('QR kütüphanesi yüklenemedi (internet?)');
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  } catch (e) {
+    return alert('Kamera açılamadı: ' + e.message + '\n\nNot: Kamera yalnızca https:// veya localhost üzerinde çalışır.');
+  }
+  const v = $('#video'); v.srcObject = stream; await v.play();
+  $('#videoWrap').style.display = 'block'; $('#camBtn').textContent = '⏹ Kamerayı kapat';
+  scanning = true; requestAnimationFrame(tick);
+}
+
+function stopCamera() {
+  scanning = false;
+  stream?.getTracks().forEach(t => t.stop()); stream = null;
+  const w = $('#videoWrap'); if (w) w.style.display = 'none';
+  const b = $('#camBtn'); if (b) b.textContent = '📷 Kamerayı aç';
+}
+
+function tick() {
+  if (!scanning) return;
+  const v = $('#video');
+  if (v && v.readyState === v.HAVE_ENOUGH_DATA) {
+    const c = $('#canvas'), ctx = c.getContext('2d', { willReadFrequently: true });
+    c.width = v.videoWidth; c.height = v.videoHeight;
+    ctx.drawImage(v, 0, 0);
+    const code = jsQR(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
+    if (code && code.data) addScan(code.data);
+  }
+  requestAnimationFrame(tick);
+}
+
+$('#fileInput').onchange = e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f || !current) return;
+  const img = new Image();
+  img.onload = () => {
+    const c = $('#canvas'), ctx = c.getContext('2d', { willReadFrequently: true });
+    c.width = img.width; c.height = img.height; ctx.drawImage(img, 0, 0);
+    const code = jsQR(ctx.getImageData(0, 0, c.width, c.height).data, c.width, c.height);
+    code ? addScan(code.data) : toast('Görselde QR bulunamadı');
+    URL.revokeObjectURL(img.src);
+  };
+  img.src = URL.createObjectURL(f);
+};
+
+/* ---------- Dışa aktar / yeniden adlandır ---------- */
+function exportCsv() {
+  const n = nb();
+  const rows = [['Tarih', 'Değer'], ...n.scans.map(s => [new Date(s.time).toISOString(), s.text])];
+  const csv = '﻿' + rows.map(r => r.map(x => `"${x.replace(/"/g, '""')}"`).join(',')).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = n.name.replace(/[^\w\-]+/g, '_') + '.csv'; a.click();
+}
+
+$('#renameBtn').onclick = () => {
+  const name = prompt('Defter adı:', nb().name);
+  if (name && name.trim()) { nb().name = name.trim(); save(); $('#title').textContent = nb().name; }
+};
+$('#backBtn').onclick = showList;
+
+showList();
+</script>
+</body>
+</html>
